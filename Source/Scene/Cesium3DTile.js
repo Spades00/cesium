@@ -9,6 +9,7 @@ import deprecationWarning from "../Core/deprecationWarning.js";
 import destroyObject from "../Core/destroyObject.js";
 import Ellipsoid from "../Core/Ellipsoid.js";
 import getMagic from "../Core/getMagic.js";
+import getStringFromTypedArray from "../Core/getStringFromTypedArray.js";
 import Intersect from "../Core/Intersect.js";
 import JulianDate from "../Core/JulianDate.js";
 import CesiumMath from "../Core/Math.js";
@@ -351,6 +352,7 @@ function Cesium3DTile(tileset, baseResource, header, parent) {
   this._shouldSelect = false;
   this._isClipped = true;
   this._clippingPlanesState = 0; // encapsulates (_isClipped, clippingPlanes.enabled) and number/function
+  this._clippingPolygonState = 0; // encapsulates (-isClipped, clippingPolygons.enabled)
   this._debugBoundingVolume = undefined;
   this._debugContentBoundingVolume = undefined;
   this._debugViewerRequestVolume = undefined;
@@ -935,6 +937,21 @@ function createPriorityFunction(tile) {
   };
 }
 
+function getJsonContent(arrayBuffer, byteOffset) {
+  byteOffset = defaultValue(byteOffset, 0);
+  var uint8Array = new Uint8Array(arrayBuffer);
+  var jsonString = getStringFromTypedArray(uint8Array, byteOffset);
+  var json;
+
+  try {
+    json = JSON.parse(jsonString);
+  } catch (error) {
+    throw new RuntimeError("Invalid tile content.");
+  }
+
+  return json;
+}
+
 /**
  * Requests the tile's content.
  * <p>
@@ -992,14 +1009,20 @@ Cesium3DTile.prototype.requestContent = function () {
       }
       var uint8Array = new Uint8Array(arrayBuffer);
       var magic = getMagic(uint8Array);
-      var contentFactory = Cesium3DTileContentFactory[magic];
+
+      var contentIdentifer = magic;
+      if (magic === "glTF") {
+        contentIdentifer = "glb";
+      }
+
+      var contentFactory = Cesium3DTileContentFactory[contentIdentifer];
       var content;
 
       // Vector and Geometry tile rendering do not support the skip LOD optimization.
       tileset._disableSkipLevelOfDetail =
         tileset._disableSkipLevelOfDetail ||
-        magic === "vctr" ||
-        magic === "geom";
+        contentIdentifer === "vctr" ||
+        contentIdentifer === "geom";
 
       if (defined(contentFactory)) {
         content = contentFactory(
@@ -1010,15 +1033,30 @@ Cesium3DTile.prototype.requestContent = function () {
           0
         );
       } else {
-        // The content may be json instead
-        content = Cesium3DTileContentFactory.json(
-          tileset,
-          that,
-          that._contentResource,
-          arrayBuffer,
-          0
-        );
-        that.hasTilesetContent = true;
+        var json = getJsonContent(arrayBuffer, 0);
+        if (defined(json.geometricError)) {
+          // Most likely a tileset JSON
+          content = Cesium3DTileContentFactory.json(
+            tileset,
+            that,
+            that._contentResource,
+            json
+          );
+          that.hasTilesetContent = true;
+        } else if (defined(json.asset)) {
+          // Most likely a glTF. Tileset JSON also has an "asset" property
+          // so this check needs to happen second
+          content = Cesium3DTileContentFactory.gltf(
+            tileset,
+            that,
+            that._contentResource,
+            json
+          );
+        }
+      }
+
+      if (!defined(content)) {
+        throw new RuntimeError("Invalid tile content.");
       }
 
       if (expired) {
@@ -1077,6 +1115,7 @@ Cesium3DTile.prototype.unloadContent = function () {
 
   this.lastStyleTime = 0.0;
   this.clippingPlanesDirty = this._clippingPlanesState === 0;
+  // TODO: Handle clipping polygon
   this._clippingPlanesState = 0;
 
   this._debugColorizeTiles = false;
@@ -1153,6 +1192,7 @@ Cesium3DTile.prototype.visibility = function (
 
   var tileset = this._tileset;
   var clippingPlanes = tileset.clippingPlanes;
+  // TODO: Handle clipping polygon
   if (defined(clippingPlanes) && clippingPlanes.enabled) {
     var intersection = clippingPlanes.computeIntersectionWithBoundingVolume(
       boundingVolume,
@@ -1199,6 +1239,9 @@ Cesium3DTile.prototype.contentVisibility = function (frameState) {
 
   var tileset = this._tileset;
   var clippingPlanes = tileset.clippingPlanes;
+
+  // TODO: handle clipping polygon
+
   if (defined(clippingPlanes) && clippingPlanes.enabled) {
     var intersection = clippingPlanes.computeIntersectionWithBoundingVolume(
       boundingVolume,
@@ -1603,6 +1646,8 @@ function updateClippingPlanes(tile, tileset) {
     tile._clippingPlanesState = currentClippingPlanesState;
     tile.clippingPlanesDirty = true;
   }
+
+  // HANDLE CLIPPING POLYGON
 }
 
 /**
@@ -1618,6 +1663,8 @@ Cesium3DTile.prototype.update = function (tileset, frameState, passOptions) {
   this._commandsLength = frameState.commandList.length - initCommandLength;
 
   this.clippingPlanesDirty = false; // reset after content update
+
+  // handle clipping polygon
 };
 
 var scratchCommandList = [];

@@ -4,6 +4,7 @@ import TerrainQuantization from "../Core/TerrainQuantization.js";
 import ShaderProgram from "../Renderer/ShaderProgram.js";
 import getClippingFunction from "./getClippingFunction.js";
 import SceneMode from "./SceneMode.js";
+import getClippingPolygonFunction from "./getPolygonClippingFunction.js";
 
 function GlobeSurfaceShader(
   numberOfDayTextures,
@@ -94,7 +95,9 @@ GlobeSurfaceShaderSet.prototype.getShaderProgram = function (options) {
   var useWebMercatorProjection = options.useWebMercatorProjection;
   var enableFog = options.enableFog;
   var enableClippingPlanes = options.enableClippingPlanes;
+  var enableClippingPolygon = options.enableClippingPolygon;
   var clippingPlanes = options.clippingPlanes;
+  var clippingPolygon = options.clippingPolygon;
   var clippedByBoundaries = options.clippedByBoundaries;
   var splitTerrain = options.splitTerrain;
   var hasImageryLayerCutout = options.hasImageryLayerCutout;
@@ -161,9 +164,13 @@ GlobeSurfaceShaderSet.prototype.getShaderProgram = function (options) {
     (highlightFillTile << 24) |
     (colorToAlpha << 25) |
     (showUndergroundColor << 26) |
-    (translucent << 27) |
-    (applyDayNightAlpha << 28) |
-    (splitTerrain << 29);
+    (enableClippingPolygon << 27) |
+    (showUndergroundColor << 28) |
+    (translucent << 29) |
+    (applyDayNightAlpha << 30) |
+	(splitTerrain << 29);
+
+	// ^ Above needs fixed. - Kurt
 
   var currentClippingShaderState = 0;
   if (defined(clippingPlanes) && clippingPlanes.length > 0) {
@@ -293,6 +300,12 @@ GlobeSurfaceShaderSet.prototype.getShaderProgram = function (options) {
 
     if (splitTerrain) {
       fs.defines.push("SPLIT_TERRAIN");
+	}
+
+    if (enableClippingPolygon) {
+      vs.defines.push("ENABLE_CLIPPING_POLYGON");
+      fs.defines.push("ENABLE_CLIPPING_POLYGON");
+      fs.sources.unshift(getClippingPolygonFunction(clippingPolygon.union));
     }
 
     if (colorCorrect) {

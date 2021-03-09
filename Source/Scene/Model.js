@@ -55,6 +55,7 @@ import when from "../ThirdParty/when.js";
 import Axis from "./Axis.js";
 import BlendingState from "./BlendingState.js";
 import ClippingPlaneCollection from "./ClippingPlaneCollection.js";
+import ClippingPolygon from "./ClippingPolygon.js";
 import ColorBlendMode from "./ColorBlendMode.js";
 import DepthFunction from "./DepthFunction.js";
 import DracoLoader from "./DracoLoader.js";
@@ -75,8 +76,10 @@ import processModelMaterialsCommon from "./processModelMaterialsCommon.js";
 import processPbrMaterials from "./processPbrMaterials.js";
 import SceneMode from "./SceneMode.js";
 import ShadowMode from "./ShadowMode.js";
+import getPolygonClippingFunction from "./getPolygonClippingFunction.js";
 
 var boundingSphereCartesian3Scratch = new Cartesian3();
+var scratchClippingPolygonEyeToWorldMatrix = new Matrix4();
 
 var ModelState = ModelUtility.ModelState;
 
@@ -210,6 +213,7 @@ var uriToGuid = {};
  * @param {Color} [options.silhouetteColor=Color.RED] The silhouette color. If more than 256 models have silhouettes enabled, there is a small chance that overlapping models will have minor artifacts.
  * @param {Number} [options.silhouetteSize=0.0] The size of the silhouette in pixels.
  * @param {ClippingPlaneCollection} [options.clippingPlanes] The {@link ClippingPlaneCollection} used to selectively disable rendering the model.
+ * @param {ClippingPolygon} [options.clippingPolygon] The {@link ClippingPolygon} used to selectively disable rendering the model.
  * @param {Boolean} [options.dequantizeInShader=true] Determines if a {@link https://github.com/google/draco|Draco} encoded model is dequantized on the GPU. This decreases total memory usage for encoded models.
  * @param {Cartesian2} [options.imageBasedLightingFactor=Cartesian2(1.0, 1.0)] Scales diffuse and specular image-based lighting from the earth, sky, atmosphere and star skybox.
  * @param {Cartesian3} [options.lightColor] The light color when shading the model. When <code>undefined</code> the scene's light color is used instead.
@@ -489,10 +493,12 @@ function Model(options) {
   this.clippingPlanes = options.clippingPlanes;
   // Used for checking if shaders need to be regenerated due to clipping plane changes.
   this._clippingPlanesState = 0;
-  // If defined, use this matrix to position the clipping planes instead of the modelMatrix.
-  // This is so that when models are part of a tileset they all get clipped relative
-  // to the root tile.
-  this.clippingPlanesOriginMatrix = undefined;
+
+  // If defined, use this matrix to transform miscellaneous properties like
+  // clipping planes and IBL instead of the modelMatrix. This is so that when
+  // models are part of a tileset these properties get transformed relative to
+  // a common reference (such as the root).
+  this.referenceMatrix = undefined;
 
   /**
    * Whether to cull back-facing geometry. When true, back face culling is
@@ -505,6 +511,11 @@ function Model(options) {
    * @default true
    */
   this.backFaceCulling = defaultValue(options.backFaceCulling, true);
+
+  this._clippingPolygon = undefined;
+
+  // Used for checking if shaders need to be regenerated due to clipping polygon changes.
+  this._clippingPolygonState = 0;
 
   /**
    * This property is for debugging only; it is not for production use nor is it optimized.
@@ -540,6 +551,10 @@ function Model(options) {
 
   // Undocumented options
   this._addBatchIdToGeneratedShaders = options.addBatchIdToGeneratedShaders;
+  this._addFeatureIdToGeneratedShaders = options.addFeatureIdToGeneratedShaders;
+  this._addFeatureIdTextureToGeneratedShaders =
+    options.addFeatureIdTextureToGeneratedShaders;
+  this._featureIdTextureInfo = options.featureIdTextureInfo;
   this._precreatedAttributes = options.precreatedAttributes;
   this._vertexShaderLoaded = options.vertexShaderLoaded;
   this._fragmentShaderLoaded = options.fragmentShaderLoaded;
@@ -564,7 +579,8 @@ function Model(options) {
   this.opaquePass = defaultValue(options.opaquePass, Pass.OPAQUE);
 
   this._computedModelMatrix = new Matrix4(); // Derived from modelMatrix and scale
-  this._clippingPlaneModelViewMatrix = Matrix4.clone(Matrix4.IDENTITY); // Derived from modelMatrix, scale, and the current view matrix
+  this._clippingPlanesMatrix = Matrix4.clone(Matrix4.IDENTITY); // Derived from reference matrix and the current view matrix
+  this._iblReferenceFrameMatrix = Matrix3.clone(Matrix3.IDENTITY); // Derived from reference matrix and the current view matrix
   this._initialRadius = undefined; // Radius without model's scale property, model-matrix scale, animations, or skins
   this._boundingSphere = undefined;
   this._scaledBoundingSphere = new BoundingSphere();
@@ -1093,6 +1109,25 @@ Object.defineProperties(Model.prototype, {
   },
 
   /**
+   * The {@link ClippingPolygon} used to selectively disable rendering the model.
+   *
+   * @memberof Model.prototype
+   *
+   * @type {ClippingPolygon}
+   */
+  clippingPolygon: {
+    get: function () {
+      return this._clippingPolygon;
+    },
+    set: function (value) {
+      if (value === this._clippingPolygon) {
+        return;
+      }
+      ClippingPolygon.setOwner(value, this, "_clippingPolygon");
+    },
+  },
+
+  /**
    * @private
    */
   pickIds: {
@@ -1300,6 +1335,11 @@ function isClippingEnabled(model) {
     clippingPlanes.enabled &&
     clippingPlanes.length !== 0
   );
+}
+
+function isClippingPolygonEnabled(model) {
+  var clippingPolygon = model._clippingPolygon;
+  return defined(clippingPolygon) && clippingPolygon.enabled;
 }
 
 /**
@@ -2499,7 +2539,7 @@ function createProgram(programToCreate, model, context) {
       model._useDefaultSpecularMaps;
     var addMatrix = usesSH || usesSM || useIBL;
     if (addMatrix) {
-      drawFS = "uniform mat4 gltf_clippingPlanesMatrix; \n" + drawFS;
+      drawFS = "uniform mat3 gltf_iblReferenceFrameMatrix; \n" + drawFS;
     }
 
     if (defined(model._sphericalHarmonicCoefficients)) {
@@ -2555,6 +2595,7 @@ function recreateProgram(programToCreate, model, context) {
 
   var clippingPlaneCollection = model.clippingPlanes;
   var addClippingPlaneCode = isClippingEnabled(model);
+  var clippingPolygon = model.clippingPolygon;
 
   var vs = shaders[program.vertexShader];
   var fs = shaders[program.fragmentShader];
@@ -2570,6 +2611,11 @@ function recreateProgram(programToCreate, model, context) {
   if (isColorShadingEnabled(model)) {
     finalFS = Model._modifyShaderForColor(finalFS);
   }
+
+  if (isClippingPolygonEnabled(model)) {
+    finalFS = modifyShaderForClippingPolygon(finalFS, clippingPolygon, context); // recreate
+  }
+
   if (addClippingPlaneCode) {
     finalFS = modifyShaderForClippingPlanes(
       finalFS,
@@ -2625,9 +2671,9 @@ function recreateProgram(programToCreate, model, context) {
       (defined(model._specularEnvironmentMapAtlas) &&
         model._specularEnvironmentMapAtlas.ready) ||
       model._useDefaultSpecularMaps;
-    var addMatrix = !addClippingPlaneCode && (usesSH || usesSM || useIBL);
+    var addMatrix = usesSH || usesSM || useIBL;
     if (addMatrix) {
-      drawFS = "uniform mat4 gltf_clippingPlanesMatrix; \n" + drawFS;
+      drawFS = "uniform mat3 gltf_iblReferenceFrameMatrix; \n" + drawFS;
     }
 
     if (defined(model._sphericalHarmonicCoefficients)) {
@@ -3020,12 +3066,10 @@ function getAttributeLocations(model, primitive) {
 
   var attributes = technique.attributes;
   var program = model._rendererResources.programs[technique.program];
-  var programVertexAttributes = program.vertexAttributes;
   var programAttributeLocations = program._attributeLocations;
 
-  // Note: WebGL shader compiler may have optimized and removed some attributes from programVertexAttributes
-  for (location in programVertexAttributes) {
-    if (programVertexAttributes.hasOwnProperty(location)) {
+  for (location in programAttributeLocations) {
+    if (programAttributeLocations.hasOwnProperty(location)) {
       var attribute = attributes[location];
       if (defined(attribute)) {
         index = programAttributeLocations[location];
@@ -3034,11 +3078,7 @@ function getAttributeLocations(model, primitive) {
     }
   }
 
-  // Always add pre-created attributes.
-  // Some pre-created attributes, like per-instance pickIds, may be compiled out of the draw program
-  // but should be included in the list of attribute locations for the pick program.
-  // This is safe to do since programVertexAttributes and programAttributeLocations are equivalent except
-  // that programVertexAttributes optimizes out unused attributes.
+  // Add pre-created attributes.
   var precreatedAttributes = model._precreatedAttributes;
   if (defined(precreatedAttributes)) {
     for (location in precreatedAttributes) {
@@ -3644,6 +3684,17 @@ function createUniformMaps(model, context) {
         return outlineTexture;
       };
     }
+
+    if (model._addFeatureIdTextureToGeneratedShaders) {
+      var uv = ModelUtility.createUniformFunction(
+        WebGLConstants.SAMPLER_2D,
+        model._featureIdTextureInfo,
+        textures,
+        defaultTexture
+      );
+      u.uniformMap.u_featureIdTexture = uv.func;
+      u.values.u_featureIdTexture = uv;
+    }
   });
 }
 
@@ -3699,25 +3750,15 @@ function createColorFunction(model) {
   };
 }
 
-var scratchClippingPlaneMatrix = new Matrix4();
 function createClippingPlanesMatrixFunction(model) {
   return function() {
-    var clippingPlanes = model.clippingPlanes;
-    if (
-      !defined(clippingPlanes) &&
-      !defined(model._sphericalHarmonicCoefficients) &&
-      !defined(model._specularEnvironmentMaps)
-    ) {
-      return Matrix4.IDENTITY;
-    }
-    var modelMatrix = defined(clippingPlanes)
-      ? clippingPlanes.modelMatrix
-      : Matrix4.IDENTITY;
-    return Matrix4.multiply(
-      model._clippingPlaneModelViewMatrix,
-      modelMatrix,
-      scratchClippingPlaneMatrix
-    );
+    return model._clippingPlanesMatrix;
+  };
+}
+
+function createIBLReferenceFrameMatrixFunction(model) {
+  return function () {
+    return model._iblReferenceFrameMatrix;
   };
 }
 
@@ -3899,6 +3940,9 @@ function createCommand(model, gltfNode, runtimeNode, context, scene3DOnly) {
         model
       ),
       gltf_clippingPlanesMatrix: createClippingPlanesMatrixFunction(model),
+      gltf_iblReferenceFrameMatrix: createIBLReferenceFrameMatrixFunction(
+        model
+      ),
       gltf_iblFactor: createIBLFactorFunction(model),
       gltf_lightColor: createLightColorFunction(model),
       gltf_sphericalHarmonicCoefficients: createSphericalHarmonicCoefficientsFunction(
@@ -3908,6 +3952,105 @@ function createCommand(model, gltfNode, runtimeNode, context, scene3DOnly) {
       gltf_specularMapSize: createSpecularEnvironmentMapSizeFunction(model),
       gltf_maxSpecularLOD: createSpecularEnvironmentMapLOD(model),
       gltf_luminanceAtZenith: createLuminanceAtZenithFunction(model)
+    });
+
+    uniformMap = combine(uniformMap, {
+      u_clippingPolygonBoundingBox: (function (model) {
+        return function () {
+          var clippingPolygon = defined(model.clippingPolygon)
+            ? model.clippingPolygon
+            : ClippingPolygon.DEFAULTS;
+          return clippingPolygon.boundingBox;
+        };
+      })(model),
+
+      u_clippingPolygonCellDimensions: (function (model) {
+        return function () {
+          var clippingPolygon = defined(model.clippingPolygon)
+            ? model.clippingPolygon
+            : ClippingPolygon.DEFAULTS;
+          return clippingPolygon.cellDimensions;
+        };
+      })(model),
+
+      u_clippingPolygonAccelerationGrid: (function (model) {
+        return function () {
+          return defined(model.clippingPolygon)
+            ? model.clippingPolygon.gridTexture
+            : model._defaultTexture;
+        };
+      })(model),
+
+      u_clippingPolygonMeshPositions: (function (model) {
+        return function () {
+          return defined(model.clippingPolygon)
+            ? model.clippingPolygon.meshPositionsTexture
+            : model._defaultTexture;
+        };
+      })(model),
+
+      u_clippingPolygonOverlappingTriangleIndices: (function (model) {
+        return function () {
+          return defined(model.clippingPolygon)
+            ? model.clippingPolygon.overlappingTriangleIndicesTexture
+            : model._defaultTexture;
+        };
+      })(model),
+
+      u_clippingPolygonAccelerationGridPixelDimensions: (function (model) {
+        return function () {
+          var clippingPolygon = defined(model.clippingPolygon)
+            ? model.clippingPolygon
+            : ClippingPolygon.DEFAULTS;
+          return clippingPolygon.gridPixelDimensions;
+        };
+      })(model),
+
+      u_clippingPolygonOverlappingTrianglePixelIndicesDimensions: (function (
+        model
+      ) {
+        return function () {
+          var clippingPolygon = defined(model.clippingPolygon)
+            ? model.clippingPolygon
+            : ClippingPolygon.DEFAULTS;
+          return clippingPolygon.overlappingTrianglePixelIndicesDimensions;
+        };
+      })(model),
+
+      u_clippingPolygonMeshPositionPixelDimensions: (function (model) {
+        return function () {
+          var clippingPolygon = defined(model.clippingPolygon)
+            ? model.clippingPolygon
+            : ClippingPolygon.DEFAULTS;
+          return clippingPolygon.meshPositionPixelDimensions;
+        };
+      })(model),
+
+      u_clippingPolygonEyeToWorldToENU: (function (model, context) {
+        return function () {
+          var worldToENU = defined(model.clippingPolygon)
+            ? model.clippingPolygon.worldToENU
+            : ClippingPolygon.DEFAULTS.worldToENU;
+
+          var eyeToWorld = context.uniformState.inverseView3D;
+          var eyeToWorldToENU = Matrix4.multiply(
+            worldToENU,
+            eyeToWorld,
+            scratchClippingPolygonEyeToWorldMatrix
+          );
+
+          return eyeToWorldToENU;
+        };
+      })(model, context),
+
+      u_clippingPolygonMinimumZ: (function (model) {
+        return function () {
+          var clippingPolygon = defined(model.clippingPolygon)
+            ? model.clippingPolygon
+            : ClippingPolygon.DEFAULTS;
+          return clippingPolygon.minimumZ;
+        };
+      })(model),
     });
 
     // Allow callback to modify the uniformMap
@@ -4855,6 +4998,25 @@ function modifyShaderForClippingPlanes(
   return shader;
 }
 
+function modifyShaderForClippingPolygon(shader, clippingPolygon, context) {
+  shader = ShaderSource.replaceMain(shader, "gltf_clip_polygon_main");
+  var clippingFunc = getPolygonClippingFunction(clippingPolygon.union);
+  // TODO: We should avoid clip space entirely to avoid precision issues
+  //       with the clipspace -> ec  -> eyespace conversion. See Globe.VS
+  //       and how it forwards EC coordinates to the fragment shader if
+  //       clipping polygons for the globe are enabled.
+
+  var newMain =
+    "void main() {\n" +
+    "vec4 positionEC = czm_windowToEyeCoordinates(gl_FragCoord);\n" +
+    "vec4 positionENU = u_clippingPolygonEyeToWorldToENU * vec4(positionEC.xyz, 1.0);\n" +
+    "clippingPolygon(positionENU.xyz);\n" +
+    "gltf_clip_polygon_main();\n" +
+    "}\n";
+
+  return shader + "#define ENABLE_CLIPPING_POLYGON\n" + clippingFunc + newMain;
+}
+
 function updateSilhouette(model, frameState, force) {
   // Generate silhouette commands when the silhouette size is greater than 0.0 and the alpha is greater than 0.0
   // There are two silhouette commands:
@@ -4887,6 +5049,13 @@ function updateClippingPlanes(model, frameState) {
     if (clippingPlanes.enabled) {
       clippingPlanes.update(frameState);
     }
+  }
+}
+
+function updateClippingPolygon(model, frameState) {
+  var clippingPolygon = model._clippingPolygon;
+  if (defined(clippingPolygon)) {
+    clippingPolygon.update(frameState);
   }
 }
 
@@ -5144,6 +5313,10 @@ function distanceDisplayConditionVisible(model, frameState) {
   return distance2 >= nearSquared && distance2 <= farSquared;
 }
 
+var scratchClippingPlanesMatrix = new Matrix4();
+var scratchIBLReferenceFrameMatrix4 = new Matrix4();
+var scratchIBLReferenceFrameMatrix3 = new Matrix3();
+
 /**
  * Called when {@link Viewer} or {@link CesiumWidget} render the scene to
  * get the draw commands needed to render this primitive.
@@ -5276,7 +5449,11 @@ Model.prototype.update = function(frameState) {
           addDefaults(gltf);
 
           var options = {
-            addBatchIdToGeneratedShaders: this._addBatchIdToGeneratedShaders
+            addBatchIdToGeneratedShaders: this._addBatchIdToGeneratedShaders,
+            addFeatureIdToGeneratedShaders: this
+              ._addFeatureIdToGeneratedShaders,
+            addFeatureIdTextureToGeneratedShaders: this
+              ._addFeatureIdTextureToGeneratedShaders,
           };
 
           processModelMaterialsCommon(gltf, options);
@@ -5366,7 +5543,7 @@ Model.prototype.update = function(frameState) {
       cachedResources.renderStates = resources.renderStates;
       cachedResources.ready = true;
 
-      // The normal attribute name is required for silhouettes, so get it before the gltf JSON is released
+      // The normal attribute name is required for silhouettes, so get it before the glTF JSON is released
       this._normalAttributeName = ModelUtility.getAttributeOrUniformBySemantic(
         this.gltf,
         "NORMAL"
@@ -5542,14 +5719,42 @@ Model.prototype.update = function(frameState) {
     updateShowBoundingVolume(this);
     updateShadows(this);
     updateClippingPlanes(this, frameState);
+    updateClippingPolygon(this, frameState);
 
     // Regenerate shaders if ClippingPlaneCollection state changed or it was removed
     var clippingPlanes = this._clippingPlanes;
     var currentClippingPlanesState = 0;
+    var currentClippingPolygonState = 0;
     var useClippingPlanes =
       defined(clippingPlanes) &&
       clippingPlanes.enabled &&
       clippingPlanes.length > 0;
+
+    // If defined, use the reference matrix to transform miscellaneous properties like
+    // clipping planes and IBL instead of the modelMatrix. This is so that when
+    // models are part of a tileset these properties get transformed relative to
+    // a common reference (such as the root).
+    var referenceMatrix = defaultValue(this.referenceMatrix, modelMatrix);
+
+    if (useClippingPlanes) {
+      var clippingPlanesMatrix = scratchClippingPlanesMatrix;
+      clippingPlanesMatrix = Matrix4.multiply(
+        context.uniformState.view3D,
+        referenceMatrix,
+        clippingPlanesMatrix
+      );
+      clippingPlanesMatrix = Matrix4.multiply(
+        clippingPlanesMatrix,
+        clippingPlanes.modelMatrix,
+        clippingPlanesMatrix
+      );
+      this._clippingPlanesMatrix = Matrix4.inverseTranspose(
+        clippingPlanesMatrix,
+        this._clippingPlanesMatrix
+      );
+      currentClippingPlanesState = clippingPlanes.clippingPlanesState;
+    }
+
     var usesSH =
       defined(this._sphericalHarmonicCoefficients) ||
       this._useDefaultSphericalHarmonics;
@@ -5557,23 +5762,41 @@ Model.prototype.update = function(frameState) {
       (defined(this._specularEnvironmentMapAtlas) &&
         this._specularEnvironmentMapAtlas.ready) ||
       this._useDefaultSpecularMaps;
-    if (useClippingPlanes || usesSH || usesSM) {
-      var clippingPlanesOriginMatrix = defaultValue(
-        this.clippingPlanesOriginMatrix,
-        modelMatrix
-      );
-      Matrix4.multiply(
-        context.uniformState.view3D,
-        clippingPlanesOriginMatrix,
-        this._clippingPlaneModelViewMatrix
-      );
-    }
 
-    if (useClippingPlanes) {
-      currentClippingPlanesState = clippingPlanes.clippingPlanesState;
+    if (usesSH || usesSM) {
+      var iblReferenceFrameMatrix3 = scratchIBLReferenceFrameMatrix3;
+      var iblReferenceFrameMatrix4 = scratchIBLReferenceFrameMatrix4;
+
+      iblReferenceFrameMatrix4 = Matrix4.multiply(
+        context.uniformState.view3D,
+        referenceMatrix,
+        iblReferenceFrameMatrix4
+      );
+      iblReferenceFrameMatrix3 = Matrix4.getMatrix3(
+        iblReferenceFrameMatrix4,
+        iblReferenceFrameMatrix3
+      );
+      iblReferenceFrameMatrix3 = Matrix3.getRotation(
+        iblReferenceFrameMatrix3,
+        iblReferenceFrameMatrix3
+      );
+      this._iblReferenceFrameMatrix = Matrix3.transpose(
+        iblReferenceFrameMatrix3,
+        this._iblReferenceFrameMatrix
+      );
     }
 
     var shouldRegenerateShaders = this._shouldRegenerateShaders;
+    var clippingPolygon = this._clippingPolygon;
+    if (defined(clippingPolygon)) {
+      currentClippingPolygonState = clippingPolygon.state;
+
+      shouldRegenerateShaders =
+        shouldRegenerateShaders ||
+        currentClippingPolygonState !== this._clippingPolygonState;
+      this._clippingPolygonState = currentClippingPolygonState;
+    }
+
     shouldRegenerateShaders =
       shouldRegenerateShaders ||
       this._clippingPlanesState !== currentClippingPlanesState;
@@ -5722,6 +5945,7 @@ function regenerateShaders(model, frameState) {
   if (
     isClippingEnabled(model) ||
     isColorShadingEnabled(model) ||
+    isClippingPolygonEnabled(model) ||
     model._shouldRegenerateShaders
   ) {
     model._shouldRegenerateShaders = false;
@@ -5842,6 +6066,16 @@ Model.prototype.destroy = function() {
 
   releaseCachedGltf(this);
   this._quantizedVertexShaders = undefined;
+
+  // Only destroy the ClippingPolygon collection if this is the owner.
+  var clippingPolygon = this._clippingPolygon;
+  if (
+    defined(clippingPolygon) &&
+    !clippingPolygon.isDestroyed() &&
+    clippingPolygon.owner === this
+  ) {
+    clippingPolygon.destroy();
+  }
 
   // Only destroy the ClippingPlaneCollection if this is the owner - if this model is part of a Cesium3DTileset,
   // _clippingPlanes references a ClippingPlaneCollection that this model does not own.

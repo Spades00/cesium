@@ -313,6 +313,11 @@ void main()
     }
 #endif
 
+#ifdef ENABLE_CLIPPING_POLYGON
+    vec4 positionENU = u_clippingPolygonEyeToWorldToENU * vec4(v_positionEC.xyz, 1.0);
+    clippingPolygon(positionENU.xyz);
+#endif
+
 #ifdef ENABLE_CLIPPING_PLANES
     float clipDistance = clip(gl_FragCoord, u_clippingPlanes, u_clippingPlanesMatrix);
 #endif

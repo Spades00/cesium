@@ -193,6 +193,7 @@ function getFragmentShaderCallback(content) {
     }
     var callback = batchTable.getFragmentShaderCallback(
       handleTranslucent,
+      undefined,
       content._diffuseAttributeOrUniformName[programId]
     );
     return defined(callback) ? callback(fs) : fs;
@@ -545,7 +546,7 @@ Batched3DModel3DTileContent.prototype.update = function (tileset, frameState) {
 
   // Update clipping planes
   var tilesetClippingPlanes = this._tileset.clippingPlanes;
-  this._model.clippingPlanesOriginMatrix = this._tileset.clippingPlanesOriginMatrix;
+  this._model.referenceMatrix = this._tileset.clippingPlanesOriginMatrix;
   if (defined(tilesetClippingPlanes) && this._tile.clippingPlanesDirty) {
     // Dereference the clipping planes from the model if they are irrelevant.
     // Link/Dereference directly to avoid ownership checks.
@@ -554,6 +555,12 @@ Batched3DModel3DTileContent.prototype.update = function (tileset, frameState) {
       tilesetClippingPlanes.enabled && this._tile._isClipped
         ? tilesetClippingPlanes
         : undefined;
+  }
+
+  var tilesetClippingPolygon = this._tileset.clippingPolygon;
+  if (defined(tilesetClippingPolygon)) {
+    // TODO: This should be behind a dirty flag like clippingPlanes
+    this._model._clippingPolygon = this._tileset.clippingPolygon;
   }
 
   // If the model references a different ClippingPlaneCollection due to the tileset's collection being replaced with a

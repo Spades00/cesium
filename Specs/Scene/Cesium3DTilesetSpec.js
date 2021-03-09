@@ -1286,7 +1286,7 @@ describe(
       });
     });
 
-    it("replacement refinement - selects upwards when traversal stops at empty tile", function () {
+    it("replacement refinement - refines when ignoring empty tiles", function () {
       // No children have content, but all grandchildren have content
       //
       //          C
@@ -1302,9 +1302,8 @@ describe(
         scene.renderForSpecs();
 
         var statistics = tileset._statistics;
-        expect(statistics.selected).toEqual(1);
-        expect(statistics.visited).toEqual(3);
-        expect(isSelected(tileset, tileset.root)).toBe(true);
+        expect(statistics.selected).toEqual(4);
+        expect(statistics.visited).toEqual(7);
       });
     });
 
@@ -2862,6 +2861,40 @@ describe(
           style.show._value = true;
           tileset.makeStyleDirty();
           expect(scene).notToRender([0, 0, 0, 255]);
+        }
+      );
+    });
+
+    it("doesn't re-evaluate style during the next update", function () {
+      return Cesium3DTilesTester.loadTileset(scene, withBatchTableUrl).then(
+        function (tileset) {
+          tileset.show = false;
+          tileset.preloadWhenHidden = true;
+          tileset.style = new Cesium3DTileStyle({ color: 'color("red")' });
+          scene.renderForSpecs();
+
+          var statistics = tileset._statisticsPerPass[Cesium3DTilePass.PRELOAD];
+          expect(statistics.numberOfTilesStyled).toBe(1);
+
+          scene.renderForSpecs();
+          expect(statistics.numberOfTilesStyled).toBe(0);
+        }
+      );
+    });
+
+    it("doesn't re-evaluate style if the style being set is the same as the active style", function () {
+      return Cesium3DTilesTester.loadTileset(scene, withBatchTableUrl).then(
+        function (tileset) {
+          var style = new Cesium3DTileStyle({ color: 'color("red")' });
+          tileset.style = style;
+          scene.renderForSpecs();
+
+          var statistics = tileset._statisticsPerPass[Cesium3DTilePass.RENDER];
+          expect(statistics.numberOfTilesStyled).toBe(1);
+
+          tileset.style = style;
+          scene.renderForSpecs();
+          expect(statistics.numberOfTilesStyled).toBe(0);
         }
       );
     });
